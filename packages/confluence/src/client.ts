@@ -113,6 +113,42 @@ export interface AttachmentInfo {
   comment?: string;
 }
 
+/** Confluence edition. Cloud serves the v2 API; Data Center/Server only v1. */
+export type ConfluenceEdition = "cloud" | "datacenter";
+
+/**
+ * Resolve the Confluence edition from a profile without any network call.
+ * Explicit `profile.edition` wins; otherwise a `cloudId` or an Atlassian-hosted
+ * domain implies Cloud, and everything else is treated as Data Center/Server.
+ */
+export function detectConfluenceEdition(profile: Profile): ConfluenceEdition {
+  if (profile.edition) return profile.edition;
+  if (profile.cloudId) return "cloud";
+  let host = "";
+  try {
+    host = new URL(profile.baseUrl).hostname.toLowerCase();
+  } catch {
+    host = "";
+  }
+  return /\.(atlassian\.net|jira\.com)$/.test(host) ? "cloud" : "datacenter";
+}
+
+/**
+ * Thrown when a requested operation has no equivalent on the connected
+ * instance's edition (e.g. folders or inline-comment resolution on Data
+ * Center). Commands should surface this as a clean "not supported" error.
+ */
+export class UnsupportedOnEditionError extends Error {
+  constructor(
+    public readonly feature: string,
+    public readonly edition: ConfluenceEdition
+  ) {
+    const label = edition === "cloud" ? "Confluence Cloud" : "Confluence Data Center";
+    super(`${feature} is not supported on ${label}.`);
+    this.name = "UnsupportedOnEditionError";
+  }
+}
+
 export class ConfluenceClient {
   private baseUrl: string;
   /**
@@ -122,6 +158,12 @@ export class ConfluenceClient {
    * already part of the site URL. Derived once from the immutable base URL.
    */
   private apiBasePath: string;
+  /**
+   * Which REST API this instance speaks. Drives capability gating and v1/v2
+   * routing. Independent of `apiBasePath` (URL shape): a Data Center instance
+   * can live at a bare host, and a context path does not by itself prove DC.
+   */
+  private edition: ConfluenceEdition;
   private authHeader: string;
   private maxRetries = 3;
   private baseDelayMs = 1000;
@@ -132,11 +174,29 @@ export class ConfluenceClient {
     // If the site URL already carries a path, the API hangs directly off it;
     // otherwise default to Cloud's `/wiki` (the long-standing behavior).
     this.apiBasePath = new URL(this.baseUrl).pathname.replace(/\/+$/, "") ? "" : "/wiki";
+    this.edition = detectConfluenceEdition(profile);
     if (profile.auth.type === "oauth") {
       throw new Error("OAuth is not implemented yet. Use API token or bearer auth.");
     }
     this.authHeader = buildAuthHeader(profile);
     this.tlsOptions = buildTlsOptions(profile);
+  }
+
+  /** The detected Confluence edition for this instance. */
+  getEdition(): ConfluenceEdition {
+    return this.edition;
+  }
+
+  /** True when the instance speaks the Cloud v2 API. */
+  isCloud(): boolean {
+    return this.edition === "cloud";
+  }
+
+  /** Throw `UnsupportedOnEditionError` when a Cloud-only feature is used on DC. */
+  private assertCloudOnly(feature: string): void {
+    if (this.edition !== "cloud") {
+      throw new UnsupportedOnEditionError(feature, this.edition);
+    }
   }
 
   /** Get the Confluence instance base URL */
@@ -379,6 +439,26 @@ export class ConfluenceClient {
           error: lastError.message,
         });
         throw lastError;
+      }
+
+      // A 2xx whose body is not JSON means we did not actually reach a v2 API
+      // endpoint — e.g. a Data Center instance answering an unknown `/api/v2`
+      // path with a login/dashboard HTML page. Treat it as an error so a
+      // soft-200 can never masquerade as data (the root cause of bogus folder
+      // records and the `NOT NULL constraint failed: pages.title` crash on DC).
+      // An empty body (204 No Content) is legitimate for void operations.
+      if (typeof data === "string" && data.trim() !== "") {
+        const error = new Error(
+          `Confluence API v2 returned a non-JSON ${res.status} response; the endpoint may not exist on this instance.`
+        );
+        logger.api("response", {
+          requestId,
+          status: res.status,
+          statusText: res.statusText,
+          durationMs: Date.now() - startTime,
+          error: error.message,
+        });
+        throw error;
       }
 
       // Log successful response
@@ -918,6 +998,7 @@ export class ConfluenceClient {
     pageId: string,
     options: { limit?: number } = {}
   ): Promise<FolderChild[]> {
+    this.assertCloudOnly("Listing direct children (incl. folders)");
     const { limit = 100 } = options;
     const children: FolderChild[] = [];
     let cursor: string | undefined;
@@ -935,6 +1016,9 @@ export class ConfluenceClient {
       const results = Array.isArray(data.results) ? data.results : [];
 
       for (const item of results) {
+        // Skip malformed records; a child with no id/title is never valid and
+        // would corrupt downstream sync state.
+        if (!item?.id || !item?.title) continue;
         children.push({
           id: item.id,
           title: item.title,
@@ -1170,8 +1254,10 @@ export class ConfluenceClient {
   /**
    * Get all pages in a scope (initial sync).
    *
-   * For space scope: uses v2 API with reliable cursor-based pagination.
-   * For tree scope: uses cursor-based CQL search via _links.next.
+   * For space scope on Cloud: uses the v2 API for reliable cursor-based
+   * pagination. On Data Center (no v2), it falls back to a v1 CQL search.
+   * For tree scope: uses cursor-based CQL search via _links.next (v1, works on
+   * both editions).
    */
   async getAllPages(params: {
     scope: SyncScope;
@@ -1185,9 +1271,12 @@ export class ConfluenceClient {
       return [pageInfo];
     }
 
-    // Space scope: use v2 API for reliable pagination
+    // Space scope: prefer v2 on Cloud; Data Center has no v2, so use v1 CQL.
     if (scope.type === "space") {
-      return this.getAllPagesInSpaceV2(scope.spaceKey, limit);
+      if (this.isCloud()) {
+        return this.getAllPagesInSpaceV2(scope.spaceKey, limit);
+      }
+      return this.searchPagesAsChangeInfo(`space="${scope.spaceKey}" AND type=page`, limit);
     }
 
     // Tree scope: use cursor-based CQL search
@@ -2016,6 +2105,15 @@ export class ConfluenceClient {
   ): Promise<FooterComment[]> {
     const { limit = 100 } = options;
 
+    if (!this.isCloud()) {
+      const items = await this.fetchCommentsV1(pageId, "footer", limit);
+      const comments = items.map((item) => this.parseFooterCommentV1(item));
+      for (const comment of comments) {
+        comment.replies = await this.getFooterCommentReplies(comment.id);
+      }
+      return comments;
+    }
+
     const data = (await this.requestV2(`/pages/${pageId}/footer-comments`, {
       query: {
         limit,
@@ -2045,6 +2143,15 @@ export class ConfluenceClient {
   ): Promise<FooterComment[]> {
     const { limit = 50 } = options;
 
+    if (!this.isCloud()) {
+      try {
+        const items = await this.fetchCommentsV1(commentId, "footer", limit);
+        return items.map((item) => this.parseFooterCommentV1(item));
+      } catch {
+        return [];
+      }
+    }
+
     try {
       const data = (await this.requestV2(`/footer-comments/${commentId}/children`, {
         query: {
@@ -2071,6 +2178,15 @@ export class ConfluenceClient {
     options: { limit?: number } = {}
   ): Promise<InlineComment[]> {
     const { limit = 100 } = options;
+
+    if (!this.isCloud()) {
+      const items = await this.fetchCommentsV1(pageId, "inline", limit);
+      const comments = items.map((item) => this.parseInlineCommentV1(item));
+      for (const comment of comments) {
+        comment.replies = await this.getInlineCommentReplies(comment.id);
+      }
+      return comments;
+    }
 
     const data = (await this.requestV2(`/pages/${pageId}/inline-comments`, {
       query: {
@@ -2100,6 +2216,15 @@ export class ConfluenceClient {
     options: { limit?: number } = {}
   ): Promise<InlineComment[]> {
     const { limit = 50 } = options;
+
+    if (!this.isCloud()) {
+      try {
+        const items = await this.fetchCommentsV1(commentId, "inline", limit);
+        return items.map((item) => this.parseInlineCommentV1(item));
+      } catch {
+        return [];
+      }
+    }
 
     try {
       const data = (await this.requestV2(`/inline-comments/${commentId}/children`, {
@@ -2177,6 +2302,85 @@ export class ConfluenceClient {
     };
   }
 
+  // ============ Comments Operations (v1 API — Data Center) ============
+
+  /**
+   * Fetch child comments of a container (page or comment) via the v1 API.
+   * Used on Data Center, which does not expose the v2 comment endpoints.
+   *
+   * GET /rest/api/content/{id}/child/comment
+   */
+  private async fetchCommentsV1(
+    containerId: string,
+    location: "footer" | "inline",
+    limit: number
+  ): Promise<any[]> {
+    const data = (await this.request(`/content/${containerId}/child/comment`, {
+      query: {
+        location,
+        expand: "body.storage,version,extensions.resolution,extensions.inlineProperties",
+        limit,
+      },
+    })) as any;
+    return Array.isArray(data.results) ? data.results : [];
+  }
+
+  /** Parse a footer comment from a v1 API response. */
+  private parseFooterCommentV1(item: any): FooterComment {
+    const by = item.version?.by ?? {};
+    return {
+      id: item.id,
+      author: {
+        displayName: by.displayName ?? by.username ?? "Unknown",
+        accountId: by.accountId ?? by.username,
+      },
+      created: item.version?.when,
+      body: item.body?.storage?.value ?? "",
+      status: item.extensions?.resolution?.status ?? "open",
+      parentId: undefined,
+      replies: [],
+    };
+  }
+
+  /** Parse an inline comment from a v1 API response. */
+  private parseInlineCommentV1(item: any): InlineComment {
+    const footer = this.parseFooterCommentV1(item);
+    const inlineProps = item.extensions?.inlineProperties ?? {};
+    return {
+      ...footer,
+      replies: [],
+      textSelection: inlineProps.originalSelection ?? "",
+      textSelectionMatchCount: undefined,
+      textSelectionMatchIndex: undefined,
+    };
+  }
+
+  /**
+   * Create a comment via the v1 API (Data Center). A top-level comment is
+   * contained by the page; a reply carries the parent comment as its ancestor.
+   *
+   * POST /rest/api/content
+   */
+  private async createCommentV1(params: {
+    pageId: string;
+    body: string;
+    parentCommentId?: string;
+  }): Promise<any> {
+    const requestBody: Record<string, unknown> = {
+      type: "comment",
+      container: { id: params.pageId, type: "page" },
+      body: { storage: { value: params.body, representation: "storage" } },
+    };
+    if (params.parentCommentId) {
+      requestBody.ancestors = [{ id: params.parentCommentId }];
+    }
+    return (await this.request("/content", {
+      method: "POST",
+      body: requestBody,
+      query: { expand: "body.storage,version" },
+    })) as any;
+  }
+
   // ============ Comment Creation (v2 API) ============
 
   /**
@@ -2190,6 +2394,11 @@ export class ConfluenceClient {
     parentCommentId?: string;
   }): Promise<FooterComment> {
     const { pageId, body, parentCommentId } = params;
+
+    if (!this.isCloud()) {
+      const created = await this.createCommentV1({ pageId, body, parentCommentId });
+      return this.parseFooterCommentV1(created);
+    }
 
     // API requires exactly ONE of pageId or parentCommentId, not both
     const requestBody: Record<string, unknown> = {
@@ -2235,6 +2444,11 @@ export class ConfluenceClient {
       parentCommentId,
     } = params;
 
+    // Creating inline comments requires the v2 inline-comment-properties API,
+    // which Data Center does not provide. Reading inline comments on DC works;
+    // creating them does not.
+    this.assertCloudOnly("Inline comment creation");
+
     // API requires exactly ONE of pageId or parentCommentId, not both
     const requestBody: Record<string, unknown> = {
       body: {
@@ -2271,6 +2485,9 @@ export class ConfluenceClient {
     commentId: string,
     type: "footer" | "inline"
   ): Promise<void> {
+    // Comment resolution is a Cloud-only workflow; Data Center has no
+    // equivalent resolution endpoint.
+    this.assertCloudOnly("Comment resolution");
     const endpoint = type === "footer" ? "footer-comments" : "inline-comments";
 
     // First fetch the comment to get its current body and version
@@ -2304,6 +2521,12 @@ export class ConfluenceClient {
     commentId: string,
     type: "footer" | "inline"
   ): Promise<void> {
+    if (!this.isCloud()) {
+      // v1 deletes any content (incl. comments) by id.
+      await this.request(`/content/${commentId}`, { method: "DELETE" });
+      return;
+    }
+
     const endpoint = type === "footer" ? "footer-comments" : "inline-comments";
 
     await this.requestV2(`/${endpoint}/${commentId}`, {
@@ -2321,7 +2544,14 @@ export class ConfluenceClient {
    * Note: Folders are a Confluence Cloud feature introduced in Sept 2024.
    */
   async getFolder(folderId: string): Promise<ConfluenceFolder> {
+    this.assertCloudOnly("Folders");
     const data = (await this.requestV2(`/folders/${folderId}`, {})) as any;
+
+    // A folder must have an id and title; anything else is a malformed response
+    // and must not be propagated into sync state.
+    if (!data?.id || !data?.title) {
+      throw new Error(`Folder ${folderId} returned an invalid response (missing id/title).`);
+    }
 
     return {
       id: data.id,
@@ -2342,6 +2572,7 @@ export class ConfluenceClient {
    * Note: Folders are a Confluence Cloud feature introduced in Sept 2024.
    */
   async updateFolder(folderId: string, title: string): Promise<ConfluenceFolder> {
+    this.assertCloudOnly("Folders");
     // First get current folder to get version number
     const current = await this.getFolder(folderId);
 
@@ -2383,6 +2614,7 @@ export class ConfluenceClient {
     folderId: string,
     options: { limit?: number } = {}
   ): Promise<FolderChild[]> {
+    this.assertCloudOnly("Folders");
     const { limit = 100 } = options;
     const children: FolderChild[] = [];
     let cursor: string | undefined;
@@ -2400,6 +2632,7 @@ export class ConfluenceClient {
       const results = Array.isArray(data.results) ? data.results : [];
 
       for (const item of results) {
+        if (!item?.id || !item?.title) continue;
         children.push({
           id: item.id,
           title: item.title,
@@ -2434,6 +2667,7 @@ export class ConfluenceClient {
    * @param spaceKey - The space key (e.g., "DOCSY")
    */
   async getSpaceFolders(spaceKey: string): Promise<ConfluenceFolder[]> {
+    this.assertCloudOnly("Folders");
     // Find homepage using CQL (page with no parent in the space)
     const searchResults = await this.searchPages(
       `space = "${spaceKey}" AND type = page ORDER BY created ASC`,
@@ -2469,6 +2703,7 @@ export class ConfluenceClient {
     title: string;
     parentFolderId?: string;
   }): Promise<ConfluenceFolder> {
+    this.assertCloudOnly("Folders");
     const { spaceId, title, parentFolderId } = params;
 
     const body: Record<string, unknown> = {
@@ -2501,6 +2736,7 @@ export class ConfluenceClient {
    * DELETE /wiki/api/v2/folders/{id}
    */
   async deleteFolder(folderId: string): Promise<void> {
+    this.assertCloudOnly("Folders");
     await this.requestV2(`/folders/${folderId}`, {
       method: "DELETE",
     });

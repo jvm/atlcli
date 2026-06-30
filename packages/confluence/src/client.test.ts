@@ -1,5 +1,5 @@
 import { describe, test, expect, mock, afterEach } from "bun:test";
-import { ConfluenceClient } from "./client.js";
+import { ConfluenceClient, UnsupportedOnEditionError } from "./client.js";
 
 // Mock profile for testing
 const mockProfile = {
@@ -374,19 +374,20 @@ describe("ConfluenceClient", () => {
       expect(url).not.toContain("/wiki/");
     });
 
-    test("v2 API requests honor the DC context path", async () => {
+    // v2 endpoints only exist on Cloud, where the context path is always
+    // `/wiki`. (Data Center has no v2 API — see the capability-gating tests.)
+    test("v2 API requests honor the Cloud /wiki path", async () => {
       const url = await captureRequestUrl(
-        "https://confluence.example.com/confluence",
+        "https://test.atlassian.net",
         { results: [] },
         (c) => c.getPageDirectChildren("123")
       );
-      expect(url).toContain("/confluence/api/v2/pages/123/direct-children");
-      expect(url).not.toContain("/wiki/");
+      expect(url).toContain("/wiki/api/v2/pages/123/direct-children");
     });
 
     // Web UI links reconstructed from a relative `_links.webui` (v2 endpoints
     // that omit `_links.base`) must use the same context path as REST requests.
-    test("web UI links use the DC context path", async () => {
+    test("web UI links use the Cloud /wiki path", async () => {
       globalThis.fetch = mock(() =>
         Promise.resolve(
           new Response(
@@ -400,15 +401,127 @@ describe("ConfluenceClient", () => {
         )
       ) as unknown as typeof fetch;
 
+      const client = new ConfluenceClient(mockProfile);
+      const children = await client.getPageDirectChildren("123");
+
+      expect(children[0]?.url).toBe(
+        "https://test.atlassian.net/wiki/spaces/TEST/pages/999/Child"
+      );
+    });
+  });
+
+  describe("edition detection and capability gating (Cloud v2 vs Data Center v1)", () => {
+    // Capture every URL the client requests, returning `body` for each call.
+    async function captureUrls(
+      baseUrl: string,
+      body: unknown,
+      call: (client: ConfluenceClient) => Promise<unknown>,
+      profileOverrides: Partial<typeof mockProfile> = {}
+    ): Promise<string[]> {
+      const urls: string[] = [];
+      globalThis.fetch = mock((url: string) => {
+        urls.push(url);
+        return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+      }) as unknown as typeof fetch;
+      await call(new ConfluenceClient({ ...mockProfile, baseUrl, ...profileOverrides }));
+      return urls;
+    }
+
+    for (const { name, profile, expected } of [
+      {
+        name: "Atlassian Cloud host",
+        profile: { baseUrl: "https://test.atlassian.net" },
+        expected: "cloud",
+      },
+      {
+        name: "jira.com host",
+        profile: { baseUrl: "https://test.jira.com" },
+        expected: "cloud",
+      },
+      {
+        name: "cloudId present",
+        profile: { baseUrl: "https://example.com", cloudId: "abc" },
+        expected: "cloud",
+      },
+      {
+        name: "Data Center context-path host",
+        profile: { baseUrl: "https://confluence.example.com/confluence" },
+        expected: "datacenter",
+      },
+      {
+        name: "bare self-hosted host defaults to DC",
+        profile: { baseUrl: "https://confluence.example.com" },
+        expected: "datacenter",
+      },
+      {
+        name: "explicit edition override wins over host",
+        profile: { baseUrl: "https://test.atlassian.net", edition: "datacenter" as const },
+        expected: "datacenter",
+      },
+    ]) {
+      test(`detects edition: ${name}`, () => {
+        const client = new ConfluenceClient({ ...mockProfile, ...profile });
+        expect(client.getEdition() as string).toBe(expected);
+        expect(client.isCloud()).toBe(expected === "cloud");
+      });
+    }
+
+    // Cloud-only operations must fail fast on Data Center rather than hit a
+    // non-existent v2 endpoint.
+    test("folder operations reject on Data Center", async () => {
       const client = new ConfluenceClient({
         ...mockProfile,
         baseUrl: "https://confluence.example.com/confluence",
       });
-      const children = await client.getPageDirectChildren("123");
-
-      expect(children[0]?.url).toBe(
-        "https://confluence.example.com/confluence/spaces/TEST/pages/999/Child"
+      await expect(client.getFolder("1")).rejects.toThrow(UnsupportedOnEditionError);
+      await expect(client.getPageDirectChildren("1")).rejects.toThrow(/not supported/i);
+      await expect(client.resolveComment("1", "footer")).rejects.toThrow(
+        UnsupportedOnEditionError
       );
+    });
+
+    // Regression for the `NOT NULL constraint failed: pages.title` crash: a
+    // soft-200 with an HTML body must be treated as an error, never as data.
+    test("getFolder rejects a non-JSON 2xx response", async () => {
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response("<html>login</html>", { status: 200 }))
+      ) as unknown as typeof fetch;
+      // Force Cloud so the request is actually attempted.
+      const client = new ConfluenceClient({ ...mockProfile, edition: "cloud" });
+      await expect(client.getFolder("1")).rejects.toThrow(/non-JSON|invalid response/i);
+    });
+
+    // Comments route to the v1 child/comment API on Data Center.
+    test("comments use the v1 API on Data Center", async () => {
+      const urls = await captureUrls(
+        "https://confluence.example.com/confluence",
+        { results: [] },
+        (c) => c.createFooterComment({ pageId: "123", body: "<p>hi</p>" })
+      );
+      expect(urls.some((u) => u.includes("/confluence/rest/api/content"))).toBe(true);
+      expect(urls.every((u) => !u.includes("/api/v2/"))).toBe(true);
+    });
+
+    // Space-scope initial sync falls back to v1 CQL search on Data Center.
+    test("space-scope getAllPages uses v1 CQL on Data Center", async () => {
+      const urls = await captureUrls(
+        "https://confluence.example.com/confluence",
+        { results: [], _links: {} },
+        (c) => c.getAllPages({ scope: { type: "space", spaceKey: "DOCSY" } })
+      );
+      expect(urls.some((u) => u.includes("/rest/api/") && u.includes("cql"))).toBe(true);
+      expect(urls.every((u) => !u.includes("/api/v2/"))).toBe(true);
+    });
+
+    // Inline comment creation has no v1 equivalent and must be rejected on DC.
+    test("inline comment creation rejects on Data Center", async () => {
+      const client = new ConfluenceClient({
+        ...mockProfile,
+        baseUrl: "https://confluence.example.com/confluence",
+      });
+      await expect(
+        client.createInlineComment({ pageId: "1", body: "<p>x</p>", textSelection: "x" })
+      ).rejects.toThrow(UnsupportedOnEditionError);
     });
   });
 

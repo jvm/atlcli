@@ -310,7 +310,7 @@ async function checkConfluenceApi(profile: Profile): Promise<CheckResult> {
     await client.getCurrentUser();
     const latency = Date.now() - start;
 
-    const wikiUrl = `${profile.baseUrl}/wiki`;
+    const edition = client.getEdition();
 
     if (latency > LATENCY_WARN_THRESHOLD) {
       return {
@@ -318,7 +318,7 @@ async function checkConfluenceApi(profile: Profile): Promise<CheckResult> {
         category: "connectivity",
         status: "warn",
         message: `Confluence API slow (${latency}ms)`,
-        details: { url: wikiUrl, latencyMs: latency },
+        details: { url: profile.baseUrl, edition, latencyMs: latency },
       };
     }
 
@@ -326,8 +326,8 @@ async function checkConfluenceApi(profile: Profile): Promise<CheckResult> {
       name: "confluence_api",
       category: "connectivity",
       status: "pass",
-      message: `Confluence API OK (${latency}ms)`,
-      details: { url: wikiUrl, latencyMs: latency },
+      message: `Confluence API OK (${latency}ms, ${edition})`,
+      details: { url: profile.baseUrl, edition, latencyMs: latency },
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

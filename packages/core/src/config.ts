@@ -22,6 +22,13 @@ export type Profile = {
   baseUrl: string;
   auth: AuthConfig;
   cloudId?: string;
+  /**
+   * Confluence edition. Determines which REST API the client uses: "cloud" =>
+   * v2 (`/api/v2`), "datacenter" => v1 (`/rest/api`). When unset, the client
+   * auto-detects from `cloudId`/host. Set explicitly to override detection
+   * (e.g. a Data Center instance hosted at a bare domain).
+   */
+  edition?: "cloud" | "datacenter";
   /** Profile-specific Jira project key */
   project?: string;
   /** Profile-specific Confluence space key */

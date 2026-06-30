@@ -13,7 +13,10 @@ import {
   saveUpdateState,
   shouldCheckForUpdates,
   getFlagValue,
+  fail,
+  ERROR_CODES,
 } from "@atlcli/core";
+import { UnsupportedOnEditionError } from "@atlcli/confluence";
 import type { CommandContext } from "@atlcli/plugin-api";
 import { handleAuth } from "./commands/auth.js";
 import { handleCompletion } from "./commands/completion.js";
@@ -207,6 +210,16 @@ async function main(): Promise<void> {
 
     // Run error hooks
     await registry.runErrorHooks(ctx, err instanceof Error ? err : new Error(String(err)));
+
+    // An operation that has no equivalent on the connected instance's edition
+    // is a clean, expected failure — surface it with a code, not a stack trace.
+    if (err instanceof UnsupportedOnEditionError) {
+      fail(opts, 1, ERROR_CODES.UNSUPPORTED, err.message, {
+        feature: err.feature,
+        edition: err.edition,
+      });
+    }
+
     throw err;
   }
 }

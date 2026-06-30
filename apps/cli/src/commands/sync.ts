@@ -446,8 +446,10 @@ class SyncEngine {
       }
     }
 
-    // Fetch and sync folders (for space and tree scopes)
-    if (this.opts.scope.type !== "page") {
+    // Fetch and sync folders (for space and tree scopes). Folders are a
+    // Cloud-only concept; Data Center hierarchies are pages-only, so there is
+    // nothing to fetch there.
+    if (this.opts.scope.type !== "page" && this.client.isCloud()) {
       let folders: ConfluenceFolder[] = [];
 
       if (this.opts.scope.type === "space") {
@@ -1364,9 +1366,11 @@ class SyncEngine {
     try {
       // Get space info
       let spaceId: string;
+      let spaceKey: string;
       if (this.opts.scope.type === "space") {
         const spaceInfo = await this.client.getSpace(this.opts.scope.spaceKey);
         spaceId = spaceInfo.id;
+        spaceKey = this.opts.scope.spaceKey;
       } else {
         // For tree scope, get space from ancestor
         const ancestorPage = await this.client.getPage(
@@ -1374,6 +1378,7 @@ class SyncEngine {
         );
         const spaceInfo = await this.client.getSpace(ancestorPage.spaceKey!);
         spaceId = spaceInfo.id;
+        spaceKey = ancestorPage.spaceKey!;
       }
 
       // Determine parent folder from file path
@@ -1402,12 +1407,21 @@ class SyncEngine {
         return;
       }
 
-      // Create the folder
-      const folder = await this.client.createFolder({
-        spaceId,
-        title: frontmatter.title || basename(folderDir),
-        parentFolderId,
-      });
+      // Create the folder. Folders are Cloud-only; on Data Center the folder
+      // node maps to an ordinary parent page (DC hierarchy is pages-only).
+      const folderTitle = frontmatter.title || basename(folderDir);
+      const folder = this.client.isCloud()
+        ? await this.client.createFolder({
+            spaceId,
+            title: folderTitle,
+            parentFolderId,
+          })
+        : await this.client.createPage({
+            spaceKey,
+            title: folderTitle,
+            storage: "",
+            parentId: parentFolderId,
+          });
 
       // Update frontmatter with new ID
       const updatedFrontmatter: AtlcliFrontmatter = {
@@ -1418,10 +1432,12 @@ class SyncEngine {
 
       // Get version
       let version = 1;
-      try {
-        version = await this.client.getFolderVersion(folder.id);
-      } catch {
-        // Version API might fail
+      if (this.client.isCloud()) {
+        try {
+          version = await this.client.getFolderVersion(folder.id);
+        } catch {
+          // Version API might fail
+        }
       }
 
       const contentHash = hashContent("");

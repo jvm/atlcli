@@ -24,6 +24,7 @@ import {
   setProfile,
   slugify,
 } from "@atlcli/core";
+import { detectConfluenceEdition } from "@atlcli/confluence";
 
 export async function handleAuth(args: string[], flags: Record<string, string | boolean | string[]>, opts: OutputOptions): Promise<void> {
   const sub = args[0];
@@ -250,6 +251,7 @@ async function handleStatus(flags: Record<string, string | boolean | string[]>, 
     profile: profile.name,
     site: profile.baseUrl,
     authType: profile.auth.type,
+    edition: detectConfluenceEdition(profile),
   };
 
   // Show auth details based on type

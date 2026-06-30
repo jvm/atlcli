@@ -33,6 +33,29 @@ atlcli supports both Atlassian deployment types with different authentication me
 
 **Server/Data Center** instances use Bearer authentication with a Personal Access Token (PAT). Use the `--bearer` flag when logging in.
 
+### API edition and feature support
+
+atlcli targets two Confluence REST APIs: the **v2** API on Cloud and the **v1**
+API on Server/Data Center. It auto-detects the edition per profile — a
+`*.atlassian.net`/`*.jira.com` host (or a stored `cloudId`) is treated as
+**cloud**, and anything else as **datacenter**. `atlcli auth status` reports the
+detected edition, and `atlcli doctor` shows it on a successful Confluence check.
+
+Override detection by setting `edition` on the profile (`cloud` or
+`datacenter`) — useful for a Data Center instance hosted at a bare domain that
+would otherwise look like Cloud.
+
+Most commands work on both editions; atlcli routes each call to the matching
+API. A few capabilities exist only on Cloud and return a clear "not supported on
+Confluence Data Center" error rather than failing obscurely:
+
+- **Folders** — a Cloud-only content type. On Data Center, docs sync represents
+  the same hierarchy with pages, and a local folder node is published as an
+  ordinary parent page.
+- **Inline comment creation** and **comment resolution** — Cloud-only workflows.
+  Reading comments (footer and inline) and adding/replying to footer comments
+  work on both editions.
+
 ## API Tokens
 
 ### Creating a Token
