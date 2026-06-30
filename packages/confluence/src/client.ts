@@ -2108,9 +2108,11 @@ export class ConfluenceClient {
     if (!this.isCloud()) {
       const items = await this.fetchCommentsV1(pageId, "footer", limit);
       const comments = items.map((item) => this.parseFooterCommentV1(item));
-      for (const comment of comments) {
-        comment.replies = await this.getFooterCommentReplies(comment.id);
-      }
+      await Promise.all(
+        comments.map(async (comment) => {
+          comment.replies = await this.getFooterCommentReplies(comment.id);
+        })
+      );
       return comments;
     }
 
@@ -2124,10 +2126,12 @@ export class ConfluenceClient {
     const results = Array.isArray(data.results) ? data.results : [];
     const comments = results.map((item: any) => this.parseFooterComment(item));
 
-    // Fetch replies for each comment
-    for (const comment of comments) {
-      comment.replies = await this.getFooterCommentReplies(comment.id);
-    }
+    // Fetch replies for each comment (independent calls — run them in parallel)
+    await Promise.all(
+      comments.map(async (comment: FooterComment) => {
+        comment.replies = await this.getFooterCommentReplies(comment.id);
+      })
+    );
 
     return comments;
   }
@@ -2182,9 +2186,11 @@ export class ConfluenceClient {
     if (!this.isCloud()) {
       const items = await this.fetchCommentsV1(pageId, "inline", limit);
       const comments = items.map((item) => this.parseInlineCommentV1(item));
-      for (const comment of comments) {
-        comment.replies = await this.getInlineCommentReplies(comment.id);
-      }
+      await Promise.all(
+        comments.map(async (comment) => {
+          comment.replies = await this.getInlineCommentReplies(comment.id);
+        })
+      );
       return comments;
     }
 
@@ -2198,10 +2204,12 @@ export class ConfluenceClient {
     const results = Array.isArray(data.results) ? data.results : [];
     const comments = results.map((item: any) => this.parseInlineComment(item));
 
-    // Fetch replies for each comment
-    for (const comment of comments) {
-      comment.replies = await this.getInlineCommentReplies(comment.id);
-    }
+    // Fetch replies for each comment (independent calls — run them in parallel)
+    await Promise.all(
+      comments.map(async (comment: InlineComment) => {
+        comment.replies = await this.getInlineCommentReplies(comment.id);
+      })
+    );
 
     return comments;
   }
@@ -2337,7 +2345,6 @@ export class ConfluenceClient {
       created: item.version?.when,
       body: item.body?.storage?.value ?? "",
       status: item.extensions?.resolution?.status ?? "open",
-      parentId: undefined,
       replies: [],
     };
   }
@@ -2350,8 +2357,6 @@ export class ConfluenceClient {
       ...footer,
       replies: [],
       textSelection: inlineProps.originalSelection ?? "",
-      textSelectionMatchCount: undefined,
-      textSelectionMatchIndex: undefined,
     };
   }
 
@@ -2522,8 +2527,8 @@ export class ConfluenceClient {
     type: "footer" | "inline"
   ): Promise<void> {
     if (!this.isCloud()) {
-      // v1 deletes any content (incl. comments) by id.
-      await this.request(`/content/${commentId}`, { method: "DELETE" });
+      // v1 deletes any content by id, comments included.
+      await this.deletePage(commentId);
       return;
     }
 
@@ -2728,6 +2733,34 @@ export class ConfluenceClient {
       url: this.buildWebUrl(data._links?.webui),
       createdAt: data.createdAt,
     };
+  }
+
+  /**
+   * Create a folder-equivalent node, hiding the edition difference from callers.
+   * On Cloud this is a real folder; on Data Center (which has no folders) it is
+   * an ordinary parent page. Returns the new node's id and title so docs/sync
+   * can record it uniformly. The space lookup only runs on Cloud, where the v2
+   * folder API needs a numeric space id.
+   */
+  async createFolderNode(params: {
+    spaceKey: string;
+    title: string;
+    parentId?: string;
+  }): Promise<{ id: string; title: string }> {
+    if (this.isCloud()) {
+      const space = await this.getSpace(params.spaceKey);
+      return this.createFolder({
+        spaceId: space.id,
+        title: params.title,
+        parentFolderId: params.parentId,
+      });
+    }
+    return this.createPage({
+      spaceKey: params.spaceKey,
+      title: params.title,
+      storage: "",
+      parentId: params.parentId,
+    });
   }
 
   /**

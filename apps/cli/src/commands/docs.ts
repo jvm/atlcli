@@ -579,91 +579,89 @@ async function handlePull(args: string[], flags: Record<string, string | boolean
     }
   }
 
-  // Detect and fetch folders (Confluence Cloud feature). Data Center has no
-  // folders, so detection is skipped there entirely — the v2 folder endpoints
-  // do not exist on DC and probing them yields bogus records.
+  // Detect and fetch folders (a Confluence Cloud feature). Data Center has no
+  // folders, so the whole detection pass is skipped there — the v2 folder
+  // endpoints do not exist on DC and probing them yields bogus records.
   let folders: ConfluenceFolder[] = [];
-  const pageIdSet = new Set(pageDetails.map((p) => p.id));
-  const potentialFolderIds = new Set<string>();
+  if (client.isCloud()) {
+    const pageIdSet = new Set(pageDetails.map((p) => p.id));
+    const potentialFolderIds = new Set<string>();
 
-  // Collect parent IDs that might be folders (not in page set)
-  for (const page of pageDetails) {
-    if (page.parentId && !pageIdSet.has(page.parentId)) {
-      potentialFolderIds.add(page.parentId);
-    }
-    // Also check ancestors
-    for (const ancestor of page.ancestors) {
-      if (!pageIdSet.has(ancestor.id)) {
-        potentialFolderIds.add(ancestor.id);
-      }
-    }
-  }
-
-  // Fetch folder details for potential folder IDs
-  if (client.isCloud() && potentialFolderIds.size > 0) {
-    for (const folderId of potentialFolderIds) {
-      try {
-        const folder = await client.getFolder(folderId);
-        folders.push(folder);
-      } catch {
-        // Not a folder or not accessible - skip
-      }
-    }
-  }
-
-  // Also check for folder children of pages (empty folders wouldn't be detected above)
-  // This catches folders nested under pages that have no page children yet
-  // Performance optimization: Only scan if < 100 pages to avoid N+1 queries
-  const folderIdSet = new Set(folders.map((f) => f.id));
-  const EMPTY_FOLDER_SCAN_THRESHOLD = 100;
-
-  if (client.isCloud() && pageDetails.length < EMPTY_FOLDER_SCAN_THRESHOLD) {
+    // Collect parent/ancestor IDs that might be folders (not in the page set)
     for (const page of pageDetails) {
-      try {
-        const children = await client.getPageDirectChildren(page.id);
-        for (const child of children) {
-          if (child.type === "folder" && !folderIdSet.has(child.id)) {
-            // Found a folder child - fetch full details
-            try {
-              const folder = await client.getFolder(child.id);
-              folders.push(folder);
-              folderIdSet.add(folder.id);
-            } catch {
-              // Skip if can't fetch folder details
-            }
-          }
+      if (page.parentId && !pageIdSet.has(page.parentId)) {
+        potentialFolderIds.add(page.parentId);
+      }
+      for (const ancestor of page.ancestors) {
+        if (!pageIdSet.has(ancestor.id)) {
+          potentialFolderIds.add(ancestor.id);
         }
-      } catch {
-        // Skip if can't fetch children (might be permission issue)
       }
     }
-  }
 
-  // Also check for nested folders (folder inside folder)
-  // Recursively check folder children until no new folders found
-  let foldersToCheck = [...folders];
-  while (foldersToCheck.length > 0) {
-    const newFolders: ConfluenceFolder[] = [];
-    for (const folder of foldersToCheck) {
-      try {
-        const children = await client.getFolderChildren(folder.id);
-        for (const child of children) {
-          if (child.type === "folder" && !folderIdSet.has(child.id)) {
-            try {
-              const nestedFolder = await client.getFolder(child.id);
-              folders.push(nestedFolder);
-              folderIdSet.add(nestedFolder.id);
-              newFolders.push(nestedFolder);
-            } catch {
-              // Skip if can't fetch folder details
-            }
-          }
+    // Fetch folder details for potential folder IDs
+    if (potentialFolderIds.size > 0) {
+      for (const folderId of potentialFolderIds) {
+        try {
+          const folder = await client.getFolder(folderId);
+          folders.push(folder);
+        } catch {
+          // Not a folder or not accessible - skip
         }
-      } catch {
-        // Skip if can't fetch children
       }
     }
-    foldersToCheck = newFolders; // Continue with newly found folders
+
+    // Also check for folder children of pages (empty folders wouldn't be
+    // detected above). Only scan if < 100 pages to avoid N+1 queries.
+    const folderIdSet = new Set(folders.map((f) => f.id));
+    const EMPTY_FOLDER_SCAN_THRESHOLD = 100;
+    if (pageDetails.length < EMPTY_FOLDER_SCAN_THRESHOLD) {
+      for (const page of pageDetails) {
+        try {
+          const children = await client.getPageDirectChildren(page.id);
+          for (const child of children) {
+            if (child.type === "folder" && !folderIdSet.has(child.id)) {
+              try {
+                const folder = await client.getFolder(child.id);
+                folders.push(folder);
+                folderIdSet.add(folder.id);
+              } catch {
+                // Skip if can't fetch folder details
+              }
+            }
+          }
+        } catch {
+          // Skip if can't fetch children (might be permission issue)
+        }
+      }
+    }
+
+    // Also check for nested folders (folder inside folder), recursively until
+    // no new folders are found.
+    let foldersToCheck = [...folders];
+    while (foldersToCheck.length > 0) {
+      const newFolders: ConfluenceFolder[] = [];
+      for (const folder of foldersToCheck) {
+        try {
+          const children = await client.getFolderChildren(folder.id);
+          for (const child of children) {
+            if (child.type === "folder" && !folderIdSet.has(child.id)) {
+              try {
+                const nestedFolder = await client.getFolder(child.id);
+                folders.push(nestedFolder);
+                folderIdSet.add(nestedFolder.id);
+                newFolders.push(nestedFolder);
+              } catch {
+                // Skip if can't fetch folder details
+              }
+            }
+          }
+        } catch {
+          // Skip if can't fetch children
+        }
+      }
+      foldersToCheck = newFolders;
+    }
   }
 
   if (folders.length > 0 && !opts.json) {
@@ -1614,9 +1612,10 @@ atlcli:
   let updated = 0;
   let created = 0;
   let skipped = 0;
+  const scopeRootId = getScopeRootId(dirConfig);
 
   for (const filePath of files) {
-    const result = await pushFile({ client, filePath, space, opts, atlcliDir: atlcliDir || undefined, state, baseUrl: dirConfig?.baseUrl, legacyEditor: hasFlag(flags, "legacy-editor") });
+    const result = await pushFile({ client, filePath, space, opts, atlcliDir: atlcliDir || undefined, state, baseUrl: dirConfig?.baseUrl, legacyEditor: hasFlag(flags, "legacy-editor"), scopeRootId });
     if (result === "updated") updated += 1;
     else if (result === "created") created += 1;
     else skipped += 1;
@@ -1878,6 +1877,7 @@ async function handleWatch(args: string[], flags: Record<string, string | boolea
   const debounceMs = Number(getFlag(flags, "debounce") ?? 500);
   const atlcliDir = findAtlcliDirWithWarning(dir, opts);
   const dirConfig = atlcliDir ? await readConfig(atlcliDir) : null;
+  const scopeRootId = getScopeRootId(dirConfig);
 
   if (!opts.json) {
     output(`Watching ${dir} for Markdown changes...`, opts);
@@ -1903,7 +1903,7 @@ async function handleWatch(args: string[], flags: Record<string, string | boolea
 
       for (const file of batch) {
         try {
-          const result = await pushFile({ client, filePath: file, space, opts, baseUrl: dirConfig?.baseUrl });
+          const result = await pushFile({ client, filePath: file, space, opts, atlcliDir: atlcliDir || undefined, baseUrl: dirConfig?.baseUrl, scopeRootId });
           const payload = { schemaVersion: "1", file, result };
           if (opts.json) {
             process.stdout.write(`${JSON.stringify(payload)}\n`);
@@ -1933,6 +1933,13 @@ async function handleWatch(args: string[], flags: Record<string, string | boolea
 
 type PushResult = "updated" | "created" | "skipped";
 
+/** Page/ancestor id the sync scope is rooted at, if it has one (space scope doesn't). */
+function getScopeRootId(dirConfig: AtlcliConfig | null): string | undefined {
+  if (!dirConfig) return undefined;
+  const scope = getConfigScope(dirConfig);
+  return scope.type === "page" ? scope.pageId : scope.type === "tree" ? scope.ancestorId : undefined;
+}
+
 async function pushFile(params: {
   client: ConfluenceClient;
   filePath: string;
@@ -1942,8 +1949,12 @@ async function pushFile(params: {
   state?: AtlcliState;
   baseUrl?: string;
   legacyEditor?: boolean;
+  /** Page/ancestor id that bounds the sync scope, used as the default parent
+   * for a brand-new top-level folder/page when no local parent is found
+   * (page-id and tree scope only; space scope has no single natural parent). */
+  scopeRootId?: string;
 }): Promise<PushResult> {
-  const { client, filePath, space, opts, atlcliDir, state, baseUrl, legacyEditor } = params;
+  const { client, filePath, space, opts, atlcliDir, state, baseUrl, legacyEditor, scopeRootId } = params;
 
   // Read file and parse frontmatter
   const rawContent = await readTextFile(filePath);
@@ -1993,30 +2004,25 @@ async function pushFile(params: {
         } catch {
           // Parent index doesn't exist or can't be read
         }
+      } else if (atlcliDir && resolve(parentDir) === resolve(atlcliDir)) {
+        // This folder sits directly under the sync root, which has no local
+        // index.md of its own (the root is the scope's page/ancestor id, not
+        // a folder file). Default its parent to that scope root so it nests
+        // under the synced tree instead of landing at the space root.
+        parentFolderId = scopeRootId;
       }
 
-      // Get space ID for folder creation
-      const spaceInfo = await client.getSpace(space);
-
       try {
-        // Folders are Cloud-only; on Data Center a folder node maps to an
-        // ordinary parent page (DC hierarchy is pages-only).
-        const newFolder = client.isCloud()
-          ? await client.createFolder({
-              spaceId: spaceInfo.id,
-              title: folderTitle,
-              parentFolderId,
-            })
-          : await client.createPage({
-              spaceKey: space,
-              title: folderTitle,
-              storage: "",
-              parentId: parentFolderId,
-            });
+        // Folders are Cloud-only; on Data Center the node is created as a page.
+        // The client owns that dispatch (and the Cloud-only space lookup).
+        const newFolder = await client.createFolderNode({
+          spaceKey: space,
+          title: folderTitle,
+          parentId: parentFolderId,
+        });
 
         if (!opts.json) {
-          const kind = client.isCloud() ? "folder" : "page (folder→page)";
-          output(`Created ${kind}: ${folderTitle} (${newFolder.id})`, opts);
+          output(`Created folder node: ${folderTitle} (${newFolder.id})`, opts);
         }
 
         // Update frontmatter with new folder ID

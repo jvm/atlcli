@@ -1,6 +1,6 @@
 import { readdir, writeFile, unlink, readFile, mkdir } from "node:fs/promises";
 import { FSWatcher, watch, existsSync } from "node:fs";
-import { join, basename, extname, dirname } from "node:path";
+import { join, basename, extname, dirname, resolve } from "node:path";
 import {
   ERROR_CODES,
   OutputOptions,
@@ -1364,20 +1364,16 @@ class SyncEngine {
 
     // New folder - create in Confluence
     try {
-      // Get space info
-      let spaceId: string;
+      // Resolve the space key for the new node. createFolderNode does the
+      // Cloud-only space-id lookup internally, so we only need the key here.
       let spaceKey: string;
       if (this.opts.scope.type === "space") {
-        const spaceInfo = await this.client.getSpace(this.opts.scope.spaceKey);
-        spaceId = spaceInfo.id;
         spaceKey = this.opts.scope.spaceKey;
       } else {
         // For tree scope, get space from ancestor
         const ancestorPage = await this.client.getPage(
           this.opts.scope.type === "tree" ? this.opts.scope.ancestorId : this.opts.scope.pageId
         );
-        const spaceInfo = await this.client.getSpace(ancestorPage.spaceKey!);
-        spaceId = spaceInfo.id;
         spaceKey = ancestorPage.spaceKey!;
       }
 
@@ -1396,6 +1392,17 @@ class SyncEngine {
         if (parentState?.contentType === "folder") {
           parentFolderId = parentId;
         }
+      } else if (resolve(parentDir) === resolve(this.opts.dir)) {
+        // This folder sits directly under the sync root, which has no local
+        // index.md of its own (the root is the scope's page/ancestor id, not
+        // a folder file). Default its parent to that scope root so it nests
+        // under the synced tree instead of landing at the space root. Space
+        // scope has no single natural parent, so it is left unset there.
+        if (this.opts.scope.type === "page") {
+          parentFolderId = this.opts.scope.pageId;
+        } else if (this.opts.scope.type === "tree") {
+          parentFolderId = this.opts.scope.ancestorId;
+        }
       }
 
       if (this.opts.dryRun) {
@@ -1407,21 +1414,13 @@ class SyncEngine {
         return;
       }
 
-      // Create the folder. Folders are Cloud-only; on Data Center the folder
-      // node maps to an ordinary parent page (DC hierarchy is pages-only).
+      // Create the folder node (a real folder on Cloud, a parent page on DC).
       const folderTitle = frontmatter.title || basename(folderDir);
-      const folder = this.client.isCloud()
-        ? await this.client.createFolder({
-            spaceId,
-            title: folderTitle,
-            parentFolderId,
-          })
-        : await this.client.createPage({
-            spaceKey,
-            title: folderTitle,
-            storage: "",
-            parentId: parentFolderId,
-          });
+      const folder = await this.client.createFolderNode({
+        spaceKey,
+        title: folderTitle,
+        parentId: parentFolderId,
+      });
 
       // Update frontmatter with new ID
       const updatedFrontmatter: AtlcliFrontmatter = {
@@ -1430,7 +1429,8 @@ class SyncEngine {
       };
       await writeTextFile(filePath, addFrontmatter("", updatedFrontmatter));
 
-      // Get version
+      // Get version. Cloud folders expose a version via the v1 content API; a
+      // DC folder-page is freshly created at version 1, so no fetch is needed.
       let version = 1;
       if (this.client.isCloud()) {
         try {
